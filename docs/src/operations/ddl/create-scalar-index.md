@@ -1,4 +1,4 @@
-# CREATE INDEX
+# CREATE SCALAR INDEX
 
 Creates a scalar index on a Lance table to accelerate queries.
 
@@ -20,7 +20,7 @@ The command uses the `ALTER TABLE` syntax to add an index.
 
 ## Index Methods
 
-The following index methods are supported:
+The following scalar index methods are supported:
 
 | Method  | Description                                                                 |
 |---------|-----------------------------------------------------------------------------|
@@ -34,11 +34,11 @@ The `CREATE INDEX` command supports options via the `WITH` clause to control ind
 
 ### Common Options
 
-These options apply to all index methods:
+These options apply to scalar index methods (`btree`, `zonemap`, `fts`):
 
 | Option  | Type    | Description                                                                                                                                                                |
 |---------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `train` | Boolean | When `false`, defer index training: register an empty index covering no rows without scanning any data, to be populated later. Default `true`. See [Deferred Index Creation](#deferred-index-creation). |
+| `train` | Boolean | When `false`, defer index training: register an empty index covering no rows without scanning any data, to be populated later. Default `true`. Not supported for `IVF_*` vector methods. See [Deferred Index Creation](#deferred-index-creation). |
 
 ### ZoneMap Options
 
@@ -186,9 +186,11 @@ to scanning the data until it is populated. There are two ways to populate it:
     dataset.optimizeIndices(OptimizeOptions.builder().build());
     ```
 
-`train = false` is supported for all index methods (`btree`, `fts`, `zonemap`). Because a deferred
-index performs no segmented build at creation time, `num_segments` cannot be combined with
-`train = false` — pass it on the eager build that populates the index instead.
+`train = false` is supported for the scalar index methods `btree`, `fts`, and `zonemap`. It is not
+yet supported for `IVF_*` vector methods — those reject `train = false` up front because Lance does
+not currently expose a vector-aware empty-index commit path. Because a deferred index performs no
+segmented build at creation time, `num_segments` cannot be combined with `train = false` — pass it
+on the eager build that populates the index instead.
 
 ## Output
 
@@ -220,4 +222,4 @@ The `CREATE INDEX` command operates as follows:
 - **Index Methods**: The `zonemap`, `btree`, and `fts` methods are supported for scalar index creation.
 - **Zonemap Column Count**: Zonemap indexes currently support a single column only. The generic `CREATE INDEX` grammar accepts a column list, but Lance rejects multi-column zonemap creation.
 - **Index Replacement**: If you create an index with the same name as an existing one, the old index will be replaced by the new one.
-- **Deferred Training**: With `train = false` the index is registered empty and is populated later, either by re-running `CREATE INDEX` (a full distributed build that replaces the empty index) or, for incremental coverage of newly appended fragments, by `Dataset.optimizeIndices` in the SDK. The SQL `OPTIMIZE` command compacts fragments and does not train deferred indexes.
+- **Deferred Training**: With `train = false` the index is registered empty and is populated later, either by re-running `CREATE INDEX` (a full distributed build that replaces the empty index) or, for incremental coverage of newly appended fragments, by `Dataset.optimizeIndices` in the SDK. The SQL `OPTIMIZE` command compacts fragments and does not train deferred indexes. `train = false` is supported only for scalar index methods (`btree`, `fts`, `zonemap`); `IVF_*` vector methods reject it because Lance does not currently expose a vector-aware empty-index commit path.
