@@ -96,7 +96,7 @@ public class LanceSparkReadOptions implements Serializable {
   private static final int DEFAULT_BATCH_SIZE = 8192;
   private static final boolean DEFAULT_USE_SCALAR_INDEX = true;
   private static final boolean DEFAULT_TOP_N_PUSH_DOWN = true;
-  private static final boolean DEFAULT_EXECUTOR_CREDENTIAL_REFRESH = true;
+  private static final boolean DEFAULT_EXECUTOR_CREDENTIAL_REFRESH = false;
 
   private final String datasetUri;
   private final String dbPath;

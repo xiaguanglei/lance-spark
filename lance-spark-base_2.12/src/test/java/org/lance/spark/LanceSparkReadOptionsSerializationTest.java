@@ -28,12 +28,13 @@ import java.util.Map;
 public class LanceSparkReadOptionsSerializationTest {
 
   @Test
-  public void testExecutorCredentialRefreshDefaultsToTrue() {
+  public void testExecutorCredentialRefreshDefaultsToFalse() {
     LanceSparkReadOptions options =
         LanceSparkReadOptions.builder().datasetUri("s3://bucket/path").build();
-    Assertions.assertTrue(
+    Assertions.assertFalse(
         options.isExecutorCredentialRefresh(),
-        "executor_credential_refresh must default to true to preserve existing behavior");
+        "executor_credential_refresh defaults to false for QIYI deployments (Hive/Kerberos"
+            + " executors typically lack a TGT; set to true for short-lived credential catalogs)");
   }
 
   @Test
