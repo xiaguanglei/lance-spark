@@ -22,12 +22,24 @@ import org.apache.spark.unsafe.types.UTF8String
 import org.lance.spark.LanceDataset
 import org.lance.spark.utils.{FieldPathUtils, Utils}
 
+import java.util.Locale
+
 import scala.collection.JavaConverters._
 
 /**
  * Physical execution of SHOW INDEXES for Lance datasets.
  *
  * This command lists all indexes defined on the underlying Lance table.
+ *
+ * The summary columns (index type and the indexed/unindexed fragment and row
+ * counts) are derived entirely from `describeIndices()` plus cheap,
+ * manifest-based dataset counts. In particular we deliberately avoid
+ * `Dataset.getIndexStatistics`, which for vector (IVF_*) indexes serializes the
+ * full centroid matrix into a JSON string. For large, multi-segment IVF indexes
+ * that JSON can reach multiple gigabytes and fail to deserialize on the driver
+ * (`Failed to deserialize from JSON` / Jackson `Decimal point not followed by a
+ * digit`), which would make SHOW INDEXES unusable even though the index itself
+ * is healthy. See the accompanying PR for details.
  */
 case class ShowIndexesExec(
     catalog: TableCatalog,
@@ -49,6 +61,12 @@ case class ShowIndexesExec(
       val indexes = dataset.describeIndices().asScala.toSeq
       val lanceSchema = dataset.getLanceSchema()
 
+      // Dataset-level totals, computed once. These are cheap manifest-derived
+      // counts (no data scan) and let us report the unindexed fragment/row
+      // counts without touching the heavy per-index statistics path.
+      val totalFragments = dataset.getFragments().size().toLong
+      val totalRows = dataset.countRows()
+
       indexes.map { idx =>
         val fieldIds = idx.getFieldIds
         val fieldNamesArray =
@@ -64,36 +82,47 @@ case class ShowIndexesExec(
           }
 
         val name = idx.getName
-        val stats = dataset.getIndexStatistics(name)
-        val indexTypeValue = stats.get("index_type")
         val indexTypeUtf8 =
-          if (indexTypeValue == null) {
-            null
-          } else {
-            UTF8String.fromString(indexTypeValue.toString.toLowerCase(java.util.Locale.ROOT))
-          }
+          Option(idx.getIndexType)
+            .map(t => UTF8String.fromString(t.toLowerCase(Locale.ROOT)))
+            .orNull
 
-        def getLong(key: String): java.lang.Long = {
-          val value = stats.get(key)
-          value match {
-            case n: java.lang.Number => java.lang.Long.valueOf(n.longValue())
-            case _ => null
-          }
+        // Fragment coverage across all segments of this logical index. A
+        // fragment that is covered by more than one delta segment is counted
+        // once, matching the semantics of index_statistics.num_indexed_fragments.
+        val segments = idx.getSegments.asScala
+        val hasFragmentInfo = segments.nonEmpty && segments.forall(_.fragments().isPresent)
+
+        val numIndexedRows: java.lang.Long = java.lang.Long.valueOf(idx.getRowsIndexed)
+
+        if (hasFragmentInfo) {
+          val indexedFragmentIds =
+            segments.flatMap(_.fragments().get.asScala.map(_.intValue())).toSet
+          val numIndexedFragments = indexedFragmentIds.size.toLong
+          val numUnindexedFragments = math.max(0L, totalFragments - numIndexedFragments)
+          val numUnindexedRows = math.max(0L, totalRows - idx.getRowsIndexed)
+
+          new GenericInternalRow(Array[Any](
+            UTF8String.fromString(name),
+            fieldNamesArray,
+            indexTypeUtf8,
+            java.lang.Long.valueOf(numIndexedFragments),
+            numIndexedRows,
+            java.lang.Long.valueOf(numUnindexedFragments),
+            java.lang.Long.valueOf(numUnindexedRows)))
+        } else {
+          // Legacy indices without a fragment bitmap: we can still report the
+          // name, fields, type and indexed-row count, but cannot derive the
+          // fragment-level breakdown, so those columns are null.
+          new GenericInternalRow(Array[Any](
+            UTF8String.fromString(name),
+            fieldNamesArray,
+            indexTypeUtf8,
+            null,
+            numIndexedRows,
+            null,
+            null))
         }
-
-        val numIndexedFragments = getLong("num_indexed_fragments")
-        val numIndexedRows = getLong("num_indexed_rows")
-        val numUnindexedFragments = getLong("num_unindexed_fragments")
-        val numUnindexedRows = getLong("num_unindexed_rows")
-
-        new GenericInternalRow(Array[Any](
-          UTF8String.fromString(name),
-          fieldNamesArray,
-          indexTypeUtf8,
-          numIndexedFragments,
-          numIndexedRows,
-          numUnindexedFragments,
-          numUnindexedRows))
       }
     } finally {
       dataset.close()

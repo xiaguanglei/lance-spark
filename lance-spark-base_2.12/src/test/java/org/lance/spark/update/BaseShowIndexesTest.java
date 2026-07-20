@@ -26,7 +26,10 @@ import java.io.IOException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Random;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -130,5 +133,136 @@ public abstract class BaseShowIndexesTest {
     // num_indexed_rows should be at least 1
     long numIndexedRows = row.getLong(4);
     Assertions.assertTrue(numIndexedRows >= 1L, "num_indexed_rows should be at least 1");
+  }
+
+  private static final int VEC_DIM = 32;
+  private static final int VEC_ROWS_PER_INSERT = 80;
+  private static final int VEC_INSERT_COUNT = 4;
+  private static final int VEC_NUM_ROWS = VEC_ROWS_PER_INSERT * VEC_INSERT_COUNT;
+
+  /**
+   * Create a table with a fixed-size-list vector column and insert several fragments so a
+   * distributed IVF index build produces multiple segments.
+   */
+  private void prepareVectorDataset() {
+    spark.sql(
+        String.format(
+            "CREATE TABLE %s (id INT NOT NULL, vec ARRAY<FLOAT> NOT NULL) USING lance "
+                + "TBLPROPERTIES ('vec.arrow.fixed-size-list.size' = '%d')",
+            fullTable, VEC_DIM));
+
+    Random random = new Random(42);
+    int rowId = 0;
+    for (int b = 0; b < VEC_INSERT_COUNT; b++) {
+      List<String> values = new ArrayList<>();
+      for (int r = 0; r < VEC_ROWS_PER_INSERT; r++) {
+        StringBuilder arr = new StringBuilder("ARRAY(");
+        for (int i = 0; i < VEC_DIM; i++) {
+          if (i > 0) arr.append(", ");
+          arr.append(String.format(Locale.ROOT, "CAST(%f AS FLOAT)", random.nextFloat()));
+        }
+        arr.append(")");
+        values.add(String.format("(%d, %s)", rowId++, arr));
+      }
+      spark.sql(
+          String.format("INSERT INTO %s (id, vec) VALUES %s", fullTable, String.join(",", values)));
+    }
+  }
+
+  /**
+   * SHOW INDEXES must work for vector (IVF_*) indexes.
+   *
+   * <p>This is the index class that regressed in production: the previous implementation called
+   * {@code Dataset.getIndexStatistics}, which serializes the full IVF centroid matrix into a JSON
+   * string. For large multi-segment indexes that JSON reached multiple GB and failed to deserialize
+   * on the driver, making SHOW INDEXES unusable. The fixed implementation derives the summary from
+   * {@code describeIndices()} plus cheap dataset counts and never materializes centroids, so this
+   * command succeeds regardless of index scale.
+   */
+  @Test
+  public void testShowIndexesOnVectorIndex() {
+    prepareVectorDataset();
+
+    // Distributed IVF_PQ build across the inserted fragments.
+    spark.sql(
+        String.format(
+            "ALTER TABLE %s CREATE INDEX vec_idx USING IVF_PQ (vec) "
+                + "WITH (num_partitions=4, num_sub_vectors=4)",
+            fullTable));
+
+    Dataset<Row> result = spark.sql(String.format("show indexes from %s", fullTable));
+
+    List<Row> rows = result.collectAsList();
+    Assertions.assertEquals(1, rows.size(), "Expected exactly one index row");
+
+    Row row = rows.get(0);
+    Assertions.assertEquals("vec_idx", row.getString(0));
+
+    @SuppressWarnings("unchecked")
+    List<String> fieldNames = row.getList(1);
+    Assertions.assertTrue(fieldNames.contains("vec"), "fields should contain column name 'vec'");
+
+    // Vector index type is surfaced either as the specific IVF_* subtype or the umbrella "vector".
+    String indexType = row.getString(2);
+    Assertions.assertTrue(
+        indexType.startsWith("ivf") || indexType.equals("vector"),
+        "index_type should be an IVF/vector type, got: " + indexType);
+
+    // The index covers every fragment exactly once, so all rows are indexed and none are left over.
+    long numIndexedFragments = row.getLong(3);
+    long numIndexedRows = row.getLong(4);
+    long numUnindexedFragments = row.getLong(5);
+    long numUnindexedRows = row.getLong(6);
+
+    Assertions.assertTrue(numIndexedFragments >= 1L, "num_indexed_fragments should be at least 1");
+    Assertions.assertEquals(VEC_NUM_ROWS, numIndexedRows, "all rows should be indexed");
+    Assertions.assertEquals(
+        0L, numUnindexedFragments, "no fragments should be left unindexed after a full build");
+    Assertions.assertEquals(0L, numUnindexedRows, "no rows should be left unindexed");
+  }
+
+  /**
+   * The fragment/row breakdown must reflect newly appended, not-yet-indexed data. After adding a
+   * fragment post-index-build, SHOW INDEXES should report the new fragment and its rows as
+   * unindexed. This exercises the dataset-total based accounting introduced by the fix.
+   */
+  @Test
+  public void testShowIndexesReportsUnindexedDataForVectorIndex() {
+    prepareVectorDataset();
+
+    spark.sql(
+        String.format(
+            "ALTER TABLE %s CREATE INDEX vec_idx USING IVF_PQ (vec) "
+                + "WITH (num_partitions=4, num_sub_vectors=4)",
+            fullTable));
+
+    // Append one more fragment that the index does not cover yet.
+    List<String> values = new ArrayList<>();
+    Random random = new Random(7);
+    for (int r = 0; r < VEC_ROWS_PER_INSERT; r++) {
+      StringBuilder arr = new StringBuilder("ARRAY(");
+      for (int i = 0; i < VEC_DIM; i++) {
+        if (i > 0) arr.append(", ");
+        arr.append(String.format(Locale.ROOT, "CAST(%f AS FLOAT)", random.nextFloat()));
+      }
+      arr.append(")");
+      values.add(String.format("(%d, %s)", VEC_NUM_ROWS + r, arr));
+    }
+    spark.sql(
+        String.format("INSERT INTO %s (id, vec) VALUES %s", fullTable, String.join(",", values)));
+
+    Dataset<Row> result = spark.sql(String.format("show indexes from %s", fullTable));
+    Row row = result.collectAsList().get(0);
+
+    long numIndexedRows = row.getLong(4);
+    long numUnindexedFragments = row.getLong(5);
+    long numUnindexedRows = row.getLong(6);
+
+    Assertions.assertEquals(
+        VEC_NUM_ROWS, numIndexedRows, "only the original rows should be indexed");
+    Assertions.assertTrue(
+        numUnindexedFragments >= 1L, "the appended fragment should be reported as unindexed");
+    Assertions.assertEquals(
+        VEC_ROWS_PER_INSERT, numUnindexedRows, "the appended rows should be reported as unindexed");
   }
 }
